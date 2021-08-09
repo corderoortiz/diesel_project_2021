@@ -1,0 +1,223 @@
+---
+title: "MOVES Model Interpolation"
+author: "Cordero Ortiz -- SUPR Lab"
+date: "8/9/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Introduction 
+
+This document will detail how outputs from diesel particulate matter MOVES model were interpolated using Ordinary Krigging.
+
+# Packages Used
+
+```{r}
+library(sp)
+library(sf)
+library(raster)
+library(gstat)
+library(dplyr)
+```
+
+# MOVES Model Outputs
+
+Model data were provided with DAT file extensions -- one for the current inventory of construction vehicles and another for the Tier 4 vehicle scenario. We can take a peek at the first few lines to determine what format the data within the .DAT file is in:
+```{r}
+readLines("./data/diesel_moves_output/CurrentInventory_DSLPM_8760HR_CONC.DAT", n = 10)
+```
+ 
+We now know that data begins on line 7 of the DAT files. Working with the current inventory file:
+```{r}
+currentInv <- read.table("./data/diesel_moves_output/CurrentInventory_DSLPM_8760HR_CONC.DAT", header = FALSE, skip = 6)
+str(currentInv)
+```
+
+Variables V1&2 are receptor coordinates in WGS84/UTM Zone 10N projected coordinate system while variables coordinates in WGS84. Variable V3 is the modeled DPM in ug/m^3 or ppb.
+Let's stick to the projected coordinate system and grab the DPM from the data frame.
+
+```{r}
+coords <- currentInv[, 1:2] #grab UTM Zone 10N Km
+coords <- apply(coords, MARGIN = c(1,2), FUN = function(x){x*1000}) # now in meters
+
+data <- currentInv[, 3] %>% as.data.frame() # grab data 
+currentInv <- cbind(data, coords)
+#dat <- dat[,3:ncol(dat)]
+names(currentInv) <- c("dpm_ppm", "lat", "lon")
+str(currentInv)
+```
+
+Repeating the above process for the Tier 4 Inventory Scenario.
+```{r}
+tier4Inv <- read.table("./data/diesel_moves_output/Tier4_Scenario_DSLPM_8760HR_CONC.DAT", header = FALSE, skip = 6)
+coords <- tier4Inv[, 1:2] #grab UTM Zone 10N Km
+coords <- apply(coords, MARGIN = c(1,2), FUN = function(x){x*1000}) # now in meters
+
+data <- tier4Inv[, 3] %>% as.data.frame() # grab data 
+tier4Inv <- cbind(data, coords)
+#dat <- dat[,3:ncol(dat)]
+names(tier4Inv) <- c("dpm_ppm", "lat", "lon")
+str(tier4Inv)
+```
+
+# Kriging
+
+## Fitting the Variogram Model
+
+The first step in krigging is the fit a variogram model to the data. The `gstat` package accepts `sp` objects, so we will first create an `sp` obejct using the current inventory model: 
+```{r}
+coordinates(currentInv) <- ~lat + lon # build `sp` object
+# assign CRS to `sp` object
+currentInv@proj4string <- CRS(as.character("+proj=utm +zone=10 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")) #
+
+# 1st order polynomial equation
+# f.1 <- as.formula(dpm_ppm ~ X + Y) # Universal
+f.1 <- as.formula(dpm_ppm ~ 1) # Ordinary
+
+
+# # Add X/Y coordinates to the `sp` data frame
+# currentInv$X <- coordinates(currentInv)[, 1]
+# currentInv$Y <-  coordinates(currentInv)[, 2]
+
+
+# Create variogram
+var.smpl <- variogram(object = f.1, data = currentInv, cloud = FALSE)
+
+currentInv.fit <- fit.variogram(var.smpl,
+                        vgm(psill=10, model="Sph", range=30000, nugget=10))
+
+plot(var.smpl, currentInv.fit, xlim=c(0, 40000), ylim = c(0, 40))
+```
+
+## Surface Generation
+
+### Create Empty Grid
+
+We need a grid to create a krigged surface, so we will create one using our point data:
+
+
+
+```{r}
+## What cell size?
+
+require(units)
+dist[dist==as_units(0, "m")] <- NA
+NND <- apply(dist, 2, min,na.rm=TRUE) %>% round(2)
+mean(NND, na.rm=TRUE) # 1Km grid seems appropriate 
+
+grid <- sp::makegrid(currentInv, cellsize = 1000)
+names(grid) <- c("X", "Y")
+coordinates(grid) <- c("X", "Y")
+gridded(grid) <- TRUE  # Create SpatialPixel object
+fullgrid(grid) <- TRUE  # Create SpatialGrid object
+
+
+# Add P's projection information to the empty grid
+grid@proj4string <- CRS(as.character("+proj=utm +zone=10 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"))
+
+plot1 <- tier4Inv %>% as.data.frame %>% 
+  ggplot(aes(lon, lat)) + geom_point(size=1) + 
+  ggtitle("Points with Measurements") + coord_equal()
+
+plot2 <- grid %>% as.data.frame() %>% 
+  ggplot(aes(X, Y)) + geom_point(size=1) + coord_equal() + 
+  ggtitle("Points to Estimate")
+
+library(gridExtra)
+grid.arrange(plot1, plot2, ncol = 2)
+
+```
+
+
+### Krigging
+
+#### Current Inventory
+```{r}
+currentInv <- currentInv[-zerodist(currentInv)[,1],]  # Remove repeated Points
+sp::zerodist(currentInv)[, 1]
+
+# f.1 <- as.formula(dpm_ppm ~ X + Y)
+f.1 <- as.formula(dpm_ppm ~ 1)
+
+# Perform the krige interpolation (note the use of the variogram model
+# created in the earlier step)
+currentInv.krg <- krige( f.1, currentInv, grid, currentInv.fit)
+
+currentInv.krg.r <- raster::raster(currentInv.krg, layer="var1.pred")
+
+metro <- st_read("~/Downloads/metro/metro.shp") %>% st_transform(32610)
+
+currentInv.krg.r.m <- raster::mask(currentInv.krg.r, metro) # clip surface to pdx metro area
+
+qtm(currentInv.krg.r.m)
+
+```
+
+#### Tier 4 Scenario
+```{r}
+
+coordinates(tier4Inv) <- ~lat + lon # build `sp` object
+# assign CRS to `sp` object
+tier4Inv@proj4string <- CRS(as.character("+proj=utm +zone=10 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")) #
+
+# 1st order polynomial equation
+# f.1 <- as.formula(dpm_ppm ~ X + Y) # Universal
+f.1 <- as.formula(dpm_ppm ~ 1) # Ordinary
+
+
+# # Add X/Y coordinates to the `sp` data frame
+# tier4Inv$X <- coordinates(tier4Inv)[, 1]
+# tier4Inv$Y <-  coordinates(tier4Inv)[, 2]
+
+
+# Create variogram
+var.smpl <- variogram(object = f.1, data = tier4Inv, cloud = FALSE)
+
+tier4Inv.fit <- fit.variogram(var.smpl,
+                        vgm(psill=10, model="Sph", range=30000, nugget=10))
+
+plot(var.smpl, tier4Inv.fit, xlim=c(0, 40000), ylim = c(0, 40))
+
+
+tier4Inv <- tier4Inv[-zerodist(tier4Inv)[,1],]  # Remove repeated Points
+sp::zerodist(tier4Inv)[, 1]
+
+# Perform the krige interpolation (note the use of the variogram model
+# created in the earlier step)
+tier4Inv.krg <- krige( f.1, tier4Inv, grid, tier4Inv.fit)
+
+tier4Inv.krg.r <- raster::raster(tier4Inv.krg, layer="var1.pred")
+
+tier4Inv.krg.r.m <- raster::mask(tier4Inv.krg.r, metro) # clip surface to pdx metro area
+
+qtm(tier4Inv.krg.r.m, ) + qtm(currentInv.krg.r.m)
+
+tier4Inv.krg.r.m@legend
+```
+
+
+```{r}
+test <- (currentInv.krg.r.m / tier4Inv.krg.r.m)
+
+names(currentInv.krg.r.m) <- "Current"
+names(tier4Inv.krg.r.m) <- "Tier 4"
+percent.delta <- (currentInv.krg.r.m / tier4Inv.krg.r.m)
+names(percent.delta) <- "times.above.bench"
+
+qtm(tier4Inv.krg.r.m, ) + qtm(currentInv.krg.r.m) + qtm(percent.delta)
+
+test <- test * 100
+test %>% qtm()
+test <- (tier4Inv.)
+qtm(test)
+
+
+
+```
+
+
+
+
+
+
