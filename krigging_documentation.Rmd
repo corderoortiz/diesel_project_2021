@@ -146,7 +146,7 @@ currentInv.krg <- krige( f.1, currentInv, grid, currentInv.fit)
 
 currentInv.krg.r <- raster::raster(currentInv.krg, layer="var1.pred")
 
-metro <- st_read("~/Downloads/metro/metro.shp") %>% st_transform(32610)
+metro <- st_read("./data/location_shapefiles/metro.shp") %>% st_transform(32610)
 
 currentInv.krg.r.m <- raster::mask(currentInv.krg.r, metro) # clip surface to pdx metro area
 
@@ -196,12 +196,12 @@ qtm(tier4Inv.krg.r.m, ) + qtm(currentInv.krg.r.m)
 tier4Inv.krg.r.m@legend
 ```
 
-
+# Testing Surfaces
 ```{r}
 test <- (currentInv.krg.r.m / tier4Inv.krg.r.m)
 
 names(currentInv.krg.r.m) <- "Current"
-names(tier4Inv.krg.r.m) <- "Tier 4"
+names(tier4Inv.krg.r.m) <- "Tier4"
 percent.delta <- (currentInv.krg.r.m / tier4Inv.krg.r.m)
 names(percent.delta) <- "times.above.bench"
 
@@ -216,8 +216,359 @@ qtm(test)
 
 ```
 
+# Exposure at locations
+```{r}
+# lower field names for postgres
+lowerName <- function(x){names(x) <- tolower(names(x)); return(x)}
+
+bus_stops <- st_read("./data/location_shapefiles/busstops.shp") %>% st_transform(32610) %>% lowerName() %>% .[metro,]
+community_centers <- st_read("./data/location_shapefiles/community_centers.shp") %>% st_transform(32610) %>% lowerName() %>% .[metro,]
+hospitals <- st_read("./data/location_shapefiles/hospital.shp") %>% st_transform(32610) %>% lowerName() %>% .[metro,]
+libraries <- st_read("./data/location_shapefiles/library.shp") %>% st_transform(32610) %>% lowerName() %>% .[metro,]
+lrt_stops <- st_read("./data/location_shapefiles/lrt_stop.shp") %>% st_transform(32610) %>% lowerName() %>% .[metro,]
+schools <- st_read("./data/location_shapefiles/schools.shp") %>% st_transform(32610) %>% lowerName() %>% .[metro,]
+school_site <- st_read("./data/location_shapefiles/school_site.shp") %>% st_transform(32610) %>% lowerName() %>% .[metro,]
+transit_center <- st_read("./data/location_shapefiles/tran_cen.shp") %>% st_transform(32610) %>% lowerName() %>% .[metro,]
+```
+
+## Write Rasters and Shapefiles into postgres database
+```{r}
+library(DBI)
+library(RPostgres)
+library(rpostgis)
+
+conn <- DBI::dbConnect(RPostgres::Postgres(), 
+               dbname = 'diesel2021', 
+               host='localhost',
+               port='5432',
+               user="cordero",
+               password='Mojo')
+
+st_write(bus_stops, dsn = conn, layer = "bus_stops", append = FALSE)
+st_write(community_centers, dsn = conn, layer = "community_centers", append = FALSE)
+st_write(hospitals, dsn = conn, layer = "hospitals", append = FALSE)
+st_write(libraries, dsn = conn, layer = "libraries", append = FALSE)
+st_write(lrt_stops, dsn = conn, layer = "lrt_stops", append = FALSE)
+st_write(schools, dsn = conn, layer = "schools", append = FALSE)
+st_write(school_site, dsn = conn, layer = "school_site", append = FALSE)
+st_write(transit_center, dsn = conn, layer = "transit_center", append = FALSE)
+pgWriteRast(con, raster = currentInv.krg.r.m, name = 'current_scenario')
+pgWriteRast(con, raster = tier4Inv.krg.r.m, name = 'tier4_scenario', )
 
 
 
+tier4 <- rpostgis::pgGetRast(conn, 'tier4_scenario')
+
+
+
+names(vectors)
+
+test <- st_read(con, layer = "schools")
+test %>% qtm()
+qtm(metro) + qtm(schools)
+query <- paste(
+  'SELECT *', 
+  'FROM schools', 
+  'WHERE "TYPE" = \'Public\''
+)
+
+query <- paste('
+  SELECT s.*, st_value(t4.rast, s.geometry) as "RasterValue", s.geometry
+  FROM tier4_scenario AS t4, schools AS s
+  WHERE st_intersects(t4.rast, s.geometry)
+')
+
+table <- 'schools'
+## Polygonizes the raster before intersect
+query <- paste('
+  SELECT p.*, st_value(t4.rast, p.geometry) as "RasterValue", p.geometry
+  FROM tier4_scenario AS t4,', table, ' AS p
+  WHERE st_intersects(st_polygon(t4.rast), p.geometry)
+')
+
+query <- paste('
+  SELECT p.*, st_value(t4.rast, p.geometry) as "RasterValue", p.geometry
+  FROM tier4_scenario AS t4, schools AS p
+  WHERE (st_intersects(t4.rast, p.geometry) AND type = \'Private\')
+  ')
+
+query <- paste('
+  SELECT st_convexhull(r.rast)
+  FROM tier4_scenario as r;
+')
+
+test <- st_read(conn, query=query)
+
+## read a raster 
+query <- 'SELECT r.rast FROM tier4_scenario as r;'
+
+
+?raster::raster()
+
+st_read(conn, query=query)
+
+
+qtm(tier4Inv.krg.r.m) + qtm(test[!is.na(test$RasterValue),], symbols.col = "RasterValue")
+
+
+tmap_mode('view')
+tm_shape(test[!is.na(test$RasterValue),]) + 
+  tm_bubbles(col = "RasterValue", size = 0.1)
+
+
+library(leaflet)
+pal <- colorNumeric(
+  palette = "YlOrRd",
+  domain = test$RasterValue
+)
+
+tier4_pal <- colorNumeric("YlOrRd", values(tier4),
+                    na.color = "transparent")
+ 
+test <- test %>% 
+  filter(!is.na(RasterValue)) %>% 
+  mutate(
+    size = ifelse(RasterValue < 0.5, 0.5, RasterValue)
+  )
+
+leaflet(test[!is.na(test$RasterValue),] %>% st_transform(4326), elementId = 'map') %>% 
+  addProviderTiles(provider = "CartoDB.DarkMatter") %>% 
+  addPolygons(data = st_transform(metro, 4326), color = "#b3b3b3", 
+              fillOpacity = 0.1, weight = 2, 
+              popup = "Portland Metro Area", group = 'pdx') %>% 
+  addCircleMarkers(radius = ~5*size, fillColor = ~pal(RasterValue), group = 'points',
+                   fillOpacity = 0.7, stroke = FALSE, 
+                   clusterOptions = markerClusterOptions(), 
+                   clusterId = "pointCluster", 
+                   popup = ~paste("<b>School Name:</b>", name, 
+                                  "<br><b>DPM Exposure:</b>", round(RasterValue, 2), "ppb",
+                                  "<br><b>School Level:</b>", level_name,
+                                  "<br><b>School Type:</b>", type,
+                                  "<br><b>School Address:</b>", address, ",", state, zipcode)) %>% 
+  addRasterImage(tier4, colors = tier4_pal, opacity = 0.5, group = 'tier 4 krigged') %>%
+  hideGroup("tier 4 krigged") %>% 
+  addLayersControl(overlayGroups = c("pdx", "points", "tier 4 krigged")) %>% 
+  addLegend(pal = tier4_pal, values = values(tier4), title = "Tier 4 Scenario", position = "bottomright") %>% 
+  addLegend(pal = pal, values = ~RasterValue, position = "bottomright", title = "Diesel PM (ppb)") %>% 
+  addEasyButton(easyButton(
+    states = list(
+      easyButtonState(
+        stateName="clustered-markers",
+        icon="ion-toggle-filled",
+        title="Remove Clusters",
+        onClick = JS("
+                     function(btn, map) {
+                     var clusterManager =
+                     map.layerManager.getLayer('cluster', 'pointCluster');
+                     clusterManager.disableClustering();
+                     btn.state('markers');
+                     }")
+        ),
+  
+      easyButtonState(
+        stateName="markers",
+        icon="ion-toggle",
+        title="Enable Clusters",
+        onClick = JS("
+                     function(btn, map) {
+                     var clusterManager =
+                     map.layerManager.getLayer('cluster', 'pointCluster');
+                     clusterManager.enableClustering();
+                     btn.state('clustered-markers');
+                     }")
+         )
+  )
+  )) %>% 
+  addEasyButton(easyButton(
+    icon="fa-crosshairs", title="Locate Me",
+    onClick=JS("function(btn, map){ map.locate({setView: true, maxZoom: 15}); }"))) 
+  
+  #addCircles(clusterOptions = markerClusterOptions())
+
+```
+
+
+## Building Leaflet Map
+```{r}
+
+conn <- DBI::dbConnect(RPostgres::Postgres(), 
+               dbname = 'diesel2021', 
+               host='localhost',
+               port='5432',
+               user="cordero",
+               password='Mojo')
+
+metro <- st_read("./data/location_shapefiles/metro.shp") %>% st_transform(32610)
+
+tier4_schools_query <- paste('
+  SELECT p.*, st_value(r.rast, p.geometry) as "tier4_dpm", p.geometry
+  FROM tier4_scenario AS r, schools AS p
+  WHERE st_intersects(r.rast, p.geometry)
+  ')
+
+tier4_schools <- st_read(conn, query = tier4_schools_query)
+
+
+## query for current scenario values
+current_schools_query<- paste('
+  SELECT p.*, st_value(r.rast, p.geometry) as "current_dpm", p.geometry
+  FROM current_scenario AS r, schools AS p
+  WHERE st_intersects(r.rast, p.geometry)
+  ')
+
+current_schools <- st_read(conn, query = current_schools_query)
+
+
+## Filter NA values from current schools and tier 4 schools
+
+current_schools <- current_schools %>% 
+  filter(!is.na(current_dpm)) %>% 
+  mutate(
+    size = ifelse(current_dpm < 2, 2, current_dpm)
+  )
+
+tier4_schools <- tier4_schools %>% 
+  filter(!is.na(tier4_dpm)) %>% 
+  mutate(
+    size = ifelse(tier4_dpm < 0.5, 0.5, tier4_dpm)
+  )
+
+
+
+tier4_scenario <- rpostgis::pgGetRast(conn, 'tier4_scenario')
+current_scenario <- rpostgis::pgGetRast(conn, 'current_scenario')
+
+
+current_schools_pal <- colorNumeric(
+  palette = "YlOrRd",
+  domain = current_schools$current_dpm
+)
+
+tier4_schools_pal <- colorNumeric(
+  palette = "YlOrRd",
+  domain = tier4_schools$current_dpm
+)
+
+
+tier4_scenario_pal <- colorNumeric("YlOrRd", values(tier4_scenario),
+                    na.color = "transparent")
+ 
+current_scenario_pal <- colorNumeric("YlOrRd", values(current_scenario),
+                    na.color = "transparent")
+
+
+
+leaflet() %>% 
+  addProviderTiles(provider = "CartoDB.DarkMatter") %>% 
+  ## add metro polygon with group id 'Portland Metro'
+  addPolygons(data = st_transform(metro, 4326), color = "#b3b3b3", 
+              fillOpacity = 0.1, weight = 2, 
+              popup = "Portland Metro Area", group = 'Portland Metro', layerId = 'pdxmetro') %>% 
+  # add Current Schools Exposure
+  addCircleMarkers(data = st_transform(current_schools, 4326), radius = ~size, fillColor = ~current_schools_pal(current_dpm), group = 'Current School Exposure',
+                   fillOpacity = 0.7, stroke = FALSE, 
+                   clusterOptions = markerClusterOptions(), 
+                   clusterId = "currentCluster", 
+                   popup = ~paste("<b>School Name:</b>", name, 
+                                  "<br><b>Current DPM Exposure:</b>", round(current_dpm, 2), "ppb",
+                                  "<br><b>School Level:</b>", level_name,
+                                  "<br><b>School Type:</b>", type,
+                                  "<br><b>School Address:</b>", address, ",", state, zipcode)) %>% 
+  # add Tier4 Schools Exposure
+  addCircleMarkers(data = st_transform(tier4_schools, 4326), radius = ~5*size, fillColor = ~tier4_schools_pal(tier4_dpm), group = 'Tier 4 School Exposure',
+                   fillOpacity = 0.7, stroke = FALSE, 
+                   clusterOptions = markerClusterOptions(), 
+                   clusterId = "tier4Cluster", 
+                   popup = ~paste("<b>School Name:</b>", name, 
+                                  "<br><b>Tier 4 DPM Exposure:</b>", round(tier4_dpm, 2), "ppb",
+                                  "<br><b>School Level:</b>", level_name,
+                                  "<br><b>School Type:</b>", type,
+                                  "<br><b>School Address:</b>", address, ",", state, zipcode)) %>% 
+  # add tier 4 scenario raster
+  addRasterImage(tier4_scenario, colors = tier4_scenario_pal, opacity = 0.5, group = 'Tier 4 Scenario') %>%
+  # add current scenario raster
+  addRasterImage(current_scenario, colors = current_scenario_pal, opacity = 0.5, group = 'Current Scenario') %>%
+  # Add Layers Control
+  addLayersControl(overlayGroups = c("Current School Exposure", "Tier 4 School Exposure", "Current Scenario", "Tier 4 Scenario")) %>% 
+  # Add Legends
+  ## Tier 4 Scenario
+  addLegend(pal = tier4_scenario_pal, values = values(tier4_scenario), title = "Tier 4 Scenario", position = "bottomright", group = "Tier 4 Scenario") %>% 
+  ## Current Scenario
+  addLegend(pal = current_scenario_pal, values = values(current_scenario), title = "Current Scenario", position = "bottomright", group = "Current Scenario") %>% 
+  ## Current Schools Exposure
+  addLegend(data = current_schools, pal = current_schools_pal, values = ~current_dpm, position = "bottomright", title = "Current DPM <br>Exposure (ppb)", group = "Current School Exposure") %>% 
+  ## Tier 4 Schools Exposure
+  addLegend(data = tier4_schools, pal = tier4_schools_pal, values = ~tier4_dpm, position = "bottomright", title = "Tier 4 DPM <br>Exposure (ppb)", group = "Tier 4 School Exposure") %>% 
+   # Hide Layers/Legends at Start
+  hideGroup(c("Tier 4 School Exposure", "Tier 4 Scenario", "Current Scenario")) %>% 
+  addEasyButton(easyButton(
+    states = list(
+      easyButtonState(
+        stateName="clustered-markers",
+        icon="ion-toggle-filled",
+        title="Remove Current Clusters",
+        onClick = JS("
+                     function(btn, map) {
+                     var clusterManager =
+                     map.layerManager.getLayer('cluster', 'currentCluster');
+                     clusterManager.disableClustering();
+                     btn.state('markers');
+                     }")
+        ),
+  
+      easyButtonState(
+        stateName="markers",
+        icon="ion-toggle",
+        title="Enable Current Clusters",
+        onClick = JS("
+                     function(btn, map) {
+                     var clusterManager =
+                     map.layerManager.getLayer('cluster', 'currentCluster');
+                     clusterManager.enableClustering();
+                     btn.state('clustered-markers');
+                     }")
+         )
+  )
+  )) %>% 
+  addEasyButton(easyButton(
+    states = list(
+      easyButtonState(
+        stateName="clustered-markers",
+        icon="ion-toggle-filled",
+        title="Remove Tier 4 Clusters",
+        onClick = JS("
+                     function(btn, map) {
+                     var clusterManager =
+                     map.layerManager.getLayer('cluster', 'tier4Cluster');
+                     clusterManager.disableClustering();
+                     btn.state('markers');
+                     }")
+        ),
+  
+      easyButtonState(
+        stateName="markers",
+        icon="ion-toggle",
+        title="Enable Tier 4 Clusters",
+        onClick = JS("
+                     function(btn, map) {
+                     var clusterManager =
+                     map.layerManager.getLayer('cluster', 'tier4Cluster');
+                     clusterManager.enableClustering();
+                     btn.state('clustered-markers');
+                     }")
+         )
+  )
+  )) %>% 
+  addEasyButton(easyButton(
+    icon="fa-crosshairs", title="Zoom To My Location",
+    onClick=JS("function(btn, map){ map.locate({setView: true, maxZoom: 15}); }"))) %>% 
+  addControl("PDX Schools Diesel PM Scenarios", position = "bottomleft")
+
+
+
+
+
+
+```
 
 
